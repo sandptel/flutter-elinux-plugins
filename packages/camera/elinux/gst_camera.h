@@ -31,6 +31,11 @@ class GstCamera {
 
   void TakePicture(OnNotifyCaptured on_notify_captured);
 
+  bool StartVideoRecording(const std::string& file_path);
+  void StopVideoRecording(OnNotifyCaptured on_video_done);
+  bool PauseVideoRecording();
+  bool ResumeVideoRecording();
+
   bool SetZoomLevel(float zoom);
   float GetMaxZoomLevel() const { return max_zoom_level_; };
   float GetMinZoomLevel() const { return min_zoom_level_; };
@@ -70,8 +75,12 @@ class GstCamera {
   float min_zoom_level_;
   float zoom_level_ = 1.0f;
   int captured_count_ = 0;
+  bool is_recording_ = false;
+  bool is_recording_paused_ = false;
 
   OnNotifyCaptured on_notify_captured_ = nullptr;
+  OnNotifyCaptured on_video_done_ = nullptr;
+  std::string video_file_path_;
 };
 
 #endif  // PACKAGES_CAMERA_CAMERA_ELINUX_GST_CAMERA_H_

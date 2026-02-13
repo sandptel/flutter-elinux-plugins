@@ -90,6 +90,110 @@ void GstCamera::TakePicture(OnNotifyCaptured on_notify_captured) {
   g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
 }
 
+bool GstCamera::StartVideoRecording(const std::string& file_path) {
+  if (!gst_.camerabin) {
+    std::cerr << "Failed to start video recording: no camerabin" << std::endl;
+    return false;
+  }
+  if (is_recording_) {
+    std::cerr << "Already recording" << std::endl;
+    return false;
+  }
+
+  video_file_path_ = file_path;
+
+  // Switch camerabin to video mode (mode=2).
+  g_object_set(gst_.camerabin, "mode", 2, NULL);
+  g_object_set(gst_.camerabin, "location", video_file_path_.c_str(), NULL);
+
+  // Start capturing video.
+  g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
+
+  is_recording_ = true;
+  is_recording_paused_ = false;
+  std::cout << "Video recording started: " << video_file_path_ << std::endl;
+  return true;
+}
+
+void GstCamera::StopVideoRecording(OnNotifyCaptured on_video_done) {
+  if (!gst_.camerabin) {
+    std::cerr << "Failed to stop video recording: no camerabin" << std::endl;
+    return;
+  }
+  if (!is_recording_) {
+    std::cerr << "Not recording" << std::endl;
+    if (on_video_done) {
+      on_video_done("");
+    }
+    return;
+  }
+
+  on_video_done_ = on_video_done;
+
+  // If paused, resume first so stop-capture can be processed.
+  if (is_recording_paused_) {
+    gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
+    is_recording_paused_ = false;
+  }
+
+  // Stop capturing video.
+  g_signal_emit_by_name(gst_.camerabin, "stop-capture", NULL);
+
+  is_recording_ = false;
+  std::cout << "Video recording stopped" << std::endl;
+
+  // Switch back to image mode (mode=1) for subsequent captures.
+  g_object_set(gst_.camerabin, "mode", 1, NULL);
+
+  // The bus sync handler should have already fired "video-done" and
+  // consumed on_video_done_. If it hasn't (some pipelines may not
+  // emit the message), invoke the callback directly.
+  if (on_video_done_) {
+    on_video_done_(video_file_path_);
+    on_video_done_ = nullptr;
+  }
+}
+
+bool GstCamera::PauseVideoRecording() {
+  if (!gst_.camerabin || !is_recording_) {
+    std::cerr << "Cannot pause: not recording" << std::endl;
+    return false;
+  }
+  if (is_recording_paused_) {
+    std::cerr << "Already paused" << std::endl;
+    return true;
+  }
+
+  auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
+  if (result == GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "Failed to pause video recording" << std::endl;
+    return false;
+  }
+  is_recording_paused_ = true;
+  std::cout << "Video recording paused" << std::endl;
+  return true;
+}
+
+bool GstCamera::ResumeVideoRecording() {
+  if (!gst_.camerabin || !is_recording_) {
+    std::cerr << "Cannot resume: not recording" << std::endl;
+    return false;
+  }
+  if (!is_recording_paused_) {
+    std::cerr << "Not paused" << std::endl;
+    return true;
+  }
+
+  auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
+  if (result == GST_STATE_CHANGE_FAILURE) {
+    std::cerr << "Failed to resume video recording" << std::endl;
+    return false;
+  }
+  is_recording_paused_ = false;
+  std::cout << "Video recording resumed" << std::endl;
+  return true;
+}
+
 bool GstCamera::SetZoomLevel(float zoom) {
   if (zoom_level_ == zoom) {
     return true;
@@ -303,6 +407,12 @@ GstBusSyncReply GstCamera::HandleGstMessage(GstBus* bus,
             self->on_notify_captured_) {
           auto const* filename = gst_structure_get_string(st, "filename");
           self->on_notify_captured_(filename);
+        } else if (gst_structure_has_name(st, "video-done") &&
+                   self->on_video_done_) {
+          auto const* filename = gst_structure_get_string(st, "filename");
+          std::string path = filename ? filename : self->video_file_path_;
+          self->on_video_done_(path);
+          self->on_video_done_ = nullptr;
         }
       }
       break;
