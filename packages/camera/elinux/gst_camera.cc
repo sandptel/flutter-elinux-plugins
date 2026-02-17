@@ -4,7 +4,13 @@
 
 #include "gst_camera.h"
 
+#include <fcntl.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <cmath>
 #include <iostream>
 
 GstCamera::GstCamera(std::unique_ptr<CameraStreamHandler> handler)
@@ -297,6 +303,269 @@ bool GstCamera::SetZoomLevel(float zoom) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+//  V4L2 direct device access
+// ---------------------------------------------------------------------------
+
+void GstCamera::OpenV4l2Device() {
+  if (v4l2_fd_ >= 0) {
+    return;  // Already open.
+  }
+
+  // Try to get the device path from camerabin's camera-source.
+  std::string device_path = "/dev/video0";
+  if (gst_.camerabin) {
+    GstElement* camera_src = nullptr;
+    g_object_get(gst_.camerabin, "camera-source", &camera_src, NULL);
+    if (camera_src) {
+      // The camera-source wraps v4l2src.  Try to find the v4l2src
+      // inside.  If camerabin uses a wrappercamerabinsrc the actual
+      // v4l2src is a child element.
+      GstElement* v4l2src = nullptr;
+      if (GST_IS_BIN(camera_src)) {
+        GstIterator* iter = gst_bin_iterate_elements(GST_BIN(camera_src));
+        GValue item = G_VALUE_INIT;
+        while (gst_iterator_next(iter, &item) == GST_ITERATOR_OK) {
+          auto* elem = GST_ELEMENT(g_value_get_object(&item));
+          gchar* factory_name = nullptr;
+          auto* factory = gst_element_get_factory(elem);
+          if (factory) {
+            factory_name =
+                const_cast<gchar*>(gst_plugin_feature_get_name(
+                    GST_PLUGIN_FEATURE(factory)));
+          }
+          if (factory_name && g_strcmp0(factory_name, "v4l2src") == 0) {
+            v4l2src = elem;
+            g_value_unset(&item);
+            break;
+          }
+          g_value_unset(&item);
+        }
+        gst_iterator_free(iter);
+      } else {
+        // camera-source might itself be a v4l2src.
+        auto* factory = gst_element_get_factory(camera_src);
+        if (factory) {
+          auto* name = gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory));
+          if (name && g_strcmp0(name, "v4l2src") == 0) {
+            v4l2src = camera_src;
+          }
+        }
+      }
+
+      if (v4l2src) {
+        gchar* dev = nullptr;
+        g_object_get(v4l2src, "device", &dev, NULL);
+        if (dev) {
+          device_path = dev;
+          g_free(dev);
+        }
+      }
+      gst_object_unref(camera_src);
+    }
+  }
+
+  v4l2_fd_ = open(device_path.c_str(), O_RDWR);
+  if (v4l2_fd_ < 0) {
+    std::cerr << "Failed to open V4L2 device: " << device_path << std::endl;
+  } else {
+    std::cout << "Opened V4L2 device: " << device_path << std::endl;
+  }
+}
+
+void GstCamera::CloseV4l2Device() {
+  if (v4l2_fd_ >= 0) {
+    close(v4l2_fd_);
+    v4l2_fd_ = -1;
+  }
+}
+
+bool GstCamera::V4l2SetCtrl(uint32_t cid, int32_t value) {
+  if (v4l2_fd_ < 0) return false;
+
+  struct v4l2_control ctrl;
+  ctrl.id = cid;
+  ctrl.value = value;
+  if (ioctl(v4l2_fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
+    std::cerr << "V4L2 VIDIOC_S_CTRL failed for CID 0x" << std::hex << cid
+              << std::dec << ": " << strerror(errno) << std::endl;
+    return false;
+  }
+  return true;
+}
+
+bool GstCamera::V4l2GetCtrl(uint32_t cid, int32_t& value) {
+  if (v4l2_fd_ < 0) return false;
+
+  struct v4l2_control ctrl;
+  ctrl.id = cid;
+  if (ioctl(v4l2_fd_, VIDIOC_G_CTRL, &ctrl) < 0) {
+    std::cerr << "V4L2 VIDIOC_G_CTRL failed for CID 0x" << std::hex << cid
+              << std::dec << ": " << strerror(errno) << std::endl;
+    return false;
+  }
+  value = ctrl.value;
+  return true;
+}
+
+bool GstCamera::V4l2QueryCtrl(uint32_t cid, int32_t& min, int32_t& max,
+                               int32_t& step, int32_t& default_val) {
+  if (v4l2_fd_ < 0) return false;
+
+  struct v4l2_queryctrl qctrl;
+  memset(&qctrl, 0, sizeof(qctrl));
+  qctrl.id = cid;
+  if (ioctl(v4l2_fd_, VIDIOC_QUERYCTRL, &qctrl) < 0) {
+    return false;  // Control not supported — not an error.
+  }
+  if (qctrl.flags & V4L2_CTRL_FLAG_DISABLED) {
+    return false;
+  }
+  min = qctrl.minimum;
+  max = qctrl.maximum;
+  step = qctrl.step;
+  default_val = qctrl.default_value;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+//  Exposure controls
+// ---------------------------------------------------------------------------
+
+bool GstCamera::SetExposureMode(const std::string& mode) {
+  OpenV4l2Device();
+  if (v4l2_fd_ < 0) {
+    // No V4L2 access — accept silently.
+    return true;
+  }
+
+  if (mode == "auto") {
+    // Most UVC webcams only expose menu entries 1 (Manual) and
+    // 3 (Aperture Priority).  "Aperture Priority" lets the camera
+    // auto-adjust exposure time — which is "auto" in Flutter terms.
+    // Try it first; fall back to V4L2_EXPOSURE_AUTO (0) for cameras
+    // that support the full enum.
+    if (V4l2SetCtrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_APERTURE_PRIORITY)) {
+      return true;
+    }
+    return V4l2SetCtrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_AUTO);
+  } else if (mode == "locked") {
+    // Switch to manual exposure.  The current absolute value is retained,
+    // effectively "locking" the exposure at its current level.
+    return V4l2SetCtrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+  }
+  std::cerr << "Unknown exposure mode: " << mode << std::endl;
+  return false;
+}
+
+double GstCamera::GetMinExposureOffset() {
+  OpenV4l2Device();
+  int32_t min = 0, max = 0, step = 0, def = 0;
+  if (V4l2QueryCtrl(V4L2_CID_EXPOSURE_ABSOLUTE, min, max, step, def)) {
+    // Convert V4L2 exposure units (100µs) to an EV-like offset.
+    // We define offset relative to the default value:
+    //   min_offset = log2(min / default)
+    if (def > 0 && min > 0) {
+      return std::log2(static_cast<double>(min) / def);
+    }
+  }
+  return 0.0;
+}
+
+double GstCamera::GetMaxExposureOffset() {
+  OpenV4l2Device();
+  int32_t min = 0, max = 0, step = 0, def = 0;
+  if (V4l2QueryCtrl(V4L2_CID_EXPOSURE_ABSOLUTE, min, max, step, def)) {
+    if (def > 0 && max > 0) {
+      return std::log2(static_cast<double>(max) / def);
+    }
+  }
+  return 0.0;
+}
+
+double GstCamera::GetExposureOffsetStepSize() {
+  OpenV4l2Device();
+  int32_t min = 0, max = 0, step = 0, def = 0;
+  if (V4l2QueryCtrl(V4L2_CID_EXPOSURE_ABSOLUTE, min, max, step, def)) {
+    // The step in V4L2 units.  Convert to approximate EV step.
+    if (def > 0 && step > 0) {
+      return std::log2(static_cast<double>(def + step) / def);
+    }
+  }
+  return 0.0;
+}
+
+double GstCamera::SetExposureOffset(double offset) {
+  OpenV4l2Device();
+  int32_t min = 0, max = 0, step = 0, def = 0;
+  if (!V4l2QueryCtrl(V4L2_CID_EXPOSURE_ABSOLUTE, min, max, step, def)) {
+    return 0.0;
+  }
+
+  // First, ensure we are in manual exposure mode so the absolute
+  // value takes effect.
+  V4l2SetCtrl(V4L2_CID_EXPOSURE_AUTO, V4L2_EXPOSURE_MANUAL);
+
+  // Convert the EV offset to an absolute V4L2 exposure value.
+  // offset (EV) = log2(abs / default)  →  abs = default * 2^offset
+  double target = (def > 0) ? def * std::pow(2.0, offset) : 1.0;
+  int32_t abs_val = static_cast<int32_t>(std::round(target));
+
+  // Clamp to the control's range.
+  if (abs_val < min) abs_val = min;
+  if (abs_val > max) abs_val = max;
+
+  V4l2SetCtrl(V4L2_CID_EXPOSURE_ABSOLUTE, abs_val);
+
+  // Read back and convert to EV offset for the actually applied value.
+  int32_t actual = abs_val;
+  V4l2GetCtrl(V4L2_CID_EXPOSURE_ABSOLUTE, actual);
+  if (def > 0 && actual > 0) {
+    return std::log2(static_cast<double>(actual) / def);
+  }
+  return 0.0;
+}
+
+// ---------------------------------------------------------------------------
+//  Focus controls
+// ---------------------------------------------------------------------------
+
+bool GstCamera::SetFocusMode(const std::string& mode) {
+  OpenV4l2Device();
+  if (v4l2_fd_ < 0) {
+    // No V4L2 access — accept silently.
+    return true;
+  }
+
+  // Check if continuous autofocus is supported.
+  int32_t min = 0, max = 0, step = 0, def = 0;
+  if (!V4l2QueryCtrl(V4L2_CID_FOCUS_AUTO, min, max, step, def)) {
+    // Camera doesn't support focus control (fixed-focus lens).
+    // Accept silently — the Dart side will track mode.
+    return true;
+  }
+
+  if (mode == "auto") {
+    return V4l2SetCtrl(V4L2_CID_FOCUS_AUTO, 1);
+  } else if (mode == "locked") {
+    return V4l2SetCtrl(V4L2_CID_FOCUS_AUTO, 0);
+  }
+  std::cerr << "Unknown focus mode: " << mode << std::endl;
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+//  Flash control
+// ---------------------------------------------------------------------------
+
+bool GstCamera::SetFlashMode(const std::string& mode) {
+  // Most USB/embedded cameras do not have flash hardware.
+  // Accept any mode silently so the Dart side doesn't throw.
+  // If V4L2_CID_FLASH_LED_MODE were supported, we'd set it here.
+  (void)mode;
+  return true;
+}
+
 const uint8_t* GstCamera::GetPreviewFrameBuffer() {
   std::shared_lock<std::shared_mutex> lock(mutex_buffer_);
   if (!gst_.buffer) {
@@ -411,6 +680,9 @@ void GstCamera::Preroll() {
 }
 
 void GstCamera::DestroyPipeline() {
+  // Close V4L2 device before tearing down GStreamer elements.
+  CloseV4l2Device();
+
   if (gst_.video_sink) {
     g_object_set(G_OBJECT(gst_.video_sink), "signal-handoffs", FALSE, NULL);
   }

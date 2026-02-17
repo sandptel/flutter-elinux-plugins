@@ -101,10 +101,31 @@ class CameraPlugin : public flutter::Plugin {
   void HandleResumeVideoRecordingCall(
       const flutter::EncodableValue* message,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetFlashModeCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetExposureModeCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetExposurePointCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleGetMinExposureOffsetCall(
       const flutter::EncodableValue* message,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleGetMaxExposureOffsetCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleGetExposureOffsetStepSizeCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetExposureOffsetCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetFocusModeCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleSetFocusPointCall(
       const flutter::EncodableValue* message,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleStartImageStreamCall(
@@ -123,6 +144,9 @@ class CameraPlugin : public flutter::Plugin {
       const flutter::EncodableValue* message,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleLockCaptureOrientationCall(
+      const flutter::EncodableValue* message,
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
+  void HandleUnlockCaptureOrientationCall(
       const flutter::EncodableValue* message,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
   void HandleDisposeCall(
@@ -186,23 +210,23 @@ void CameraPlugin::HandleMethodCall(
   } else if (!method_name.compare(kCameraChannelApiResumeVideoRecording)) {
     HandleResumeVideoRecordingCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiSetFlashMode)) {
-    result->NotImplemented();
+    HandleSetFlashModeCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiSetExposureMode)) {
-    result->NotImplemented();
+    HandleSetExposureModeCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiSetExposurePoint)) {
-    result->NotImplemented();
+    HandleSetExposurePointCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiGetMinExposureOffset)) {
     HandleGetMinExposureOffsetCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiGetMaxExposureOffset)) {
     HandleGetMaxExposureOffsetCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiGetExposureOffsetStepSize)) {
-    result->NotImplemented();
+    HandleGetExposureOffsetStepSizeCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiSetExposureOffset)) {
-    result->NotImplemented();
+    HandleSetExposureOffsetCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiSetFocusMode)) {
-    result->NotImplemented();
+    HandleSetFocusModeCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiSetFocusPoint)) {
-    result->NotImplemented();
+    HandleSetFocusPointCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiStartImageStream)) {
     HandleStartImageStreamCall(method_call.arguments(), std::move(result));
   } else if (!method_name.compare(kCameraChannelApiStopImageStream)) {
@@ -217,7 +241,8 @@ void CameraPlugin::HandleMethodCall(
     HandleLockCaptureOrientationCall(method_call.arguments(),
                                      std::move(result));
   } else if (!method_name.compare(kCameraChannelApiUnlockCaptureOrientation)) {
-    result->NotImplemented();
+    HandleUnlockCaptureOrientationCall(method_call.arguments(),
+                                       std::move(result));
   } else if (!method_name.compare(kCameraChannelApiDispose)) {
     HandleDisposeCall(method_call.arguments(), std::move(result));
   } else {
@@ -418,6 +443,59 @@ void CameraPlugin::HandleResumeVideoRecordingCall(
   }
 }
 
+void CameraPlugin::HandleSetFlashModeCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!camera_) {
+    result->Error("Not found an active camera",
+                  "Check for creating a camera device");
+    return;
+  }
+  auto& map = std::get<flutter::EncodableMap>(*message);
+  auto mode_it = map.find(flutter::EncodableValue("mode"));
+  if (mode_it == map.end()) {
+    result->Error("Invalid argument", "Missing 'mode' parameter");
+    return;
+  }
+  auto& mode = std::get<std::string>(mode_it->second);
+  if (camera_->SetFlashMode(mode)) {
+    result->Success();
+  } else {
+    result->Error("Failed to set flash mode", "Could not set flash mode");
+  }
+}
+
+void CameraPlugin::HandleSetExposureModeCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!camera_) {
+    result->Error("Not found an active camera",
+                  "Check for creating a camera device");
+    return;
+  }
+  auto& map = std::get<flutter::EncodableMap>(*message);
+  auto mode_it = map.find(flutter::EncodableValue("mode"));
+  if (mode_it == map.end()) {
+    result->Error("Invalid argument", "Missing 'mode' parameter");
+    return;
+  }
+  auto& mode = std::get<std::string>(mode_it->second);
+  if (camera_->SetExposureMode(mode)) {
+    result->Success();
+  } else {
+    result->Error("Failed to set exposure mode",
+                  "Could not set exposure mode");
+  }
+}
+
+void CameraPlugin::HandleSetExposurePointCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  // V4L2 does not support exposure point/region.
+  // Accept silently so the Dart side doesn't throw.
+  result->Success();
+}
+
 void CameraPlugin::HandleGetMinExposureOffsetCall(
     const flutter::EncodableValue* message,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
@@ -426,9 +504,7 @@ void CameraPlugin::HandleGetMinExposureOffsetCall(
                   "Check for creating a camera device");
     return;
   }
-
-  // TODO: Implement exposure control support
-  double value = 0.0;
+  double value = camera_->GetMinExposureOffset();
   result->Success(flutter::EncodableValue(value));
 }
 
@@ -440,10 +516,69 @@ void CameraPlugin::HandleGetMaxExposureOffsetCall(
                   "Check for creating a camera device");
     return;
   }
-
-  // TODO: Implement exposure control support
-  double value = 0.0;
+  double value = camera_->GetMaxExposureOffset();
   result->Success(flutter::EncodableValue(value));
+}
+
+void CameraPlugin::HandleGetExposureOffsetStepSizeCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!camera_) {
+    result->Error("Not found an active camera",
+                  "Check for creating a camera device");
+    return;
+  }
+  double value = camera_->GetExposureOffsetStepSize();
+  result->Success(flutter::EncodableValue(value));
+}
+
+void CameraPlugin::HandleSetExposureOffsetCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!camera_) {
+    result->Error("Not found an active camera",
+                  "Check for creating a camera device");
+    return;
+  }
+  auto& map = std::get<flutter::EncodableMap>(*message);
+  auto offset_it = map.find(flutter::EncodableValue("offset"));
+  if (offset_it == map.end()) {
+    result->Error("Invalid argument", "Missing 'offset' parameter");
+    return;
+  }
+  double offset = std::get<double>(offset_it->second);
+  double applied = camera_->SetExposureOffset(offset);
+  result->Success(flutter::EncodableValue(applied));
+}
+
+void CameraPlugin::HandleSetFocusModeCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  if (!camera_) {
+    result->Error("Not found an active camera",
+                  "Check for creating a camera device");
+    return;
+  }
+  auto& map = std::get<flutter::EncodableMap>(*message);
+  auto mode_it = map.find(flutter::EncodableValue("mode"));
+  if (mode_it == map.end()) {
+    result->Error("Invalid argument", "Missing 'mode' parameter");
+    return;
+  }
+  auto& mode = std::get<std::string>(mode_it->second);
+  if (camera_->SetFocusMode(mode)) {
+    result->Success();
+  } else {
+    result->Error("Failed to set focus mode", "Could not set focus mode");
+  }
+}
+
+void CameraPlugin::HandleSetFocusPointCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  // V4L2 does not support focus point/region.
+  // Accept silently so the Dart side doesn't throw.
+  result->Success();
 }
 
 void CameraPlugin::HandleStartImageStreamCall(
@@ -503,7 +638,15 @@ void CameraPlugin::HandleSetZoomLevelCall(
 void CameraPlugin::HandleLockCaptureOrientationCall(
     const flutter::EncodableValue* message,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
-  result->NotImplemented();
+  // Orientation locking is a no-op on embedded Linux — there is no
+  // accelerometer or orientation sensor.  Accept silently.
+  result->Success();
+}
+
+void CameraPlugin::HandleUnlockCaptureOrientationCall(
+    const flutter::EncodableValue* message,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  result->Success();
 }
 
 void CameraPlugin::HandleDisposeCall(

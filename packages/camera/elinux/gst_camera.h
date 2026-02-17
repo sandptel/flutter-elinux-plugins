@@ -49,6 +49,25 @@ class GstCamera {
   int32_t GetPreviewWidth() const { return width_; };
   int32_t GetPreviewHeight() const { return height_; };
 
+  // ---------------------------------------------------------------------------
+  //  Exposure controls
+  // ---------------------------------------------------------------------------
+  bool SetExposureMode(const std::string& mode);
+  double GetMinExposureOffset();
+  double GetMaxExposureOffset();
+  double GetExposureOffsetStepSize();
+  double SetExposureOffset(double offset);
+
+  // ---------------------------------------------------------------------------
+  //  Focus controls
+  // ---------------------------------------------------------------------------
+  bool SetFocusMode(const std::string& mode);
+
+  // ---------------------------------------------------------------------------
+  //  Flash control
+  // ---------------------------------------------------------------------------
+  bool SetFlashMode(const std::string& mode);
+
  private:
   struct GstCameraElements {
     GstElement* pipeline;
@@ -75,6 +94,14 @@ class GstCamera {
   // Returns true if the message was received, false on timeout.
   bool WaitForVideoDone(int timeout_seconds);
 
+  // V4L2 direct device access for controls not exposed by camerabin.
+  void OpenV4l2Device();
+  void CloseV4l2Device();
+  bool V4l2SetCtrl(uint32_t cid, int32_t value);
+  bool V4l2GetCtrl(uint32_t cid, int32_t& value);
+  bool V4l2QueryCtrl(uint32_t cid, int32_t& min, int32_t& max,
+                     int32_t& step, int32_t& default_val);
+
   GstCameraElements gst_;
   std::unique_ptr<uint32_t> pixels_;
   int32_t width_ = -1;
@@ -100,6 +127,9 @@ class GstCamera {
   std::mutex video_done_mutex_;
   std::condition_variable video_done_cv_;
   bool video_done_received_ = false;
+
+  // V4L2 file descriptor for direct camera control access.
+  int v4l2_fd_ = -1;
 };
 
 #endif  // PACKAGES_CAMERA_CAMERA_ELINUX_GST_CAMERA_H_
