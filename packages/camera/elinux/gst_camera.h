@@ -55,6 +55,7 @@ class GstCamera {
     GstElement* camerabin;
     GstElement* video_convert;
     GstElement* video_sink;
+    GstElement* video_valve;
     GstElement* output;
     GstBus* bus;
     GstBuffer* buffer;
