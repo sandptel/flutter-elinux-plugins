@@ -347,8 +347,12 @@ void CameraPlugin::HandleStartVideoRecordingCall(
     return;
   }
 
-  std::string file_path =
-      g_strdup_printf("video_%04d.mp4", video_recording_count_++);
+  std::string file_path;
+  {
+    gchar* raw = g_strdup_printf("video_%04d.mp4", video_recording_count_++);
+    file_path = raw;
+    g_free(raw);
+  }
 
   if (camera_->StartVideoRecording(file_path)) {
     result->Success();

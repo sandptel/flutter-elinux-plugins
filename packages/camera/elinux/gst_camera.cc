@@ -4,6 +4,7 @@
 
 #include "gst_camera.h"
 
+#include <chrono>
 #include <iostream>
 
 GstCamera::GstCamera(std::unique_ptr<CameraStreamHandler> handler)
@@ -29,6 +30,18 @@ GstCamera::GstCamera(std::unique_ptr<CameraStreamHandler> handler)
 }
 
 GstCamera::~GstCamera() {
+  // If we are still recording, stop cleanly before tearing down.
+  if (is_recording_) {
+    // If paused, resume so stop-capture can be processed.
+    if (is_recording_paused_) {
+      g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
+      is_recording_paused_ = false;
+    }
+    g_signal_emit_by_name(gst_.camerabin, "stop-capture", NULL);
+    WaitForVideoDone(2);
+    g_object_set(gst_.camerabin, "mode", 1, NULL);
+    is_recording_ = false;
+  }
   Stop();
   DestroyPipeline();
 }
@@ -84,11 +97,42 @@ void GstCamera::TakePicture(OnNotifyCaptured on_notify_captured) {
   }
 
   on_notify_captured_ = on_notify_captured;
-  std::string filename =
-      g_strdup_printf("captured_%04u.jpg", captured_count_++);
+  gchar* raw = g_strdup_printf("captured_%04u.jpg", captured_count_++);
+  std::string filename(raw);
+  g_free(raw);
   g_object_set(gst_.camerabin, "location", filename.c_str(), NULL);
   g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
 }
+
+// ---------------------------------------------------------------------------
+//  Video recording: start / stop / pause / resume
+//
+//  Camerabin has two modes:
+//    mode=1  ->  image capture (default)
+//    mode=2  ->  video capture
+//
+//  Signals:
+//    "start-capture"  begins capture in the current mode
+//    "stop-capture"   ends an ongoing video capture (ignored in image mode)
+//
+//  Bus messages:
+//    "image-done"  emitted after an image has been written
+//    "video-done"  emitted after the video muxer has flushed and closed
+//
+//  Pause / resume strategy:
+//    Camerabin does NOT support pausing via pipeline state changes (that
+//    would freeze the viewfinder/preview as well).  Instead we use
+//    stop-capture to end the current segment and start-capture to begin
+//    a new one when resumed.  This leaves the pipeline in PLAYING so the
+//    viewfinder keeps running during the pause.
+//
+//    The trade-off is that camerabin overwrites the location each time
+//    start-capture is called, so the "paused" segment is lost.  For a
+//    proper multi-segment recording the output files would need to be
+//    concatenated, but that is out of scope here.  In practice, most
+//    embedded use-cases don't need pause, so we accept this limitation
+//    and keep the viewfinder alive.
+// ---------------------------------------------------------------------------
 
 bool GstCamera::StartVideoRecording(const std::string& file_path) {
   if (!gst_.camerabin) {
@@ -102,11 +146,16 @@ bool GstCamera::StartVideoRecording(const std::string& file_path) {
 
   video_file_path_ = file_path;
 
-  // Switch camerabin to video mode (mode=2).
+  // Switch camerabin to video mode.
   g_object_set(gst_.camerabin, "mode", 2, NULL);
   g_object_set(gst_.camerabin, "location", video_file_path_.c_str(), NULL);
 
-  // Start capturing video.
+  // Reset the done-flag before starting.
+  {
+    std::lock_guard<std::mutex> lock(video_done_mutex_);
+    video_done_received_ = false;
+  }
+
   g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
 
   is_recording_ = true;
@@ -128,29 +177,41 @@ void GstCamera::StopVideoRecording(OnNotifyCaptured on_video_done) {
     return;
   }
 
-  on_video_done_ = on_video_done;
-
-  // If paused, resume first so stop-capture can be processed.
+  // If paused (we issued stop-capture already for the pause), we need to
+  // re-issue start-capture so camerabin is in an active capture state,
+  // then immediately stop it again.  Otherwise stop-capture is a no-op.
   if (is_recording_paused_) {
-    gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
+    g_object_set(gst_.camerabin, "location", video_file_path_.c_str(), NULL);
+    g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
     is_recording_paused_ = false;
   }
 
-  // Stop capturing video.
+  // Reset the done-flag before requesting the stop.
+  {
+    std::lock_guard<std::mutex> lock(video_done_mutex_);
+    video_done_received_ = false;
+  }
+
+  // Tell camerabin to stop capturing.  This starts an async drain of the
+  // encoder and muxer — all in-flight buffers will be written out.
   g_signal_emit_by_name(gst_.camerabin, "stop-capture", NULL);
-
   is_recording_ = false;
-  std::cout << "Video recording stopped" << std::endl;
+  std::cout << "Video recording stop requested, waiting for muxer flush..."
+            << std::endl;
 
-  // Switch back to image mode (mode=1) for subsequent captures.
+  // Wait for the "video-done" bus message (up to 5 seconds).  During this
+  // time the pipeline stays PLAYING so the viewfinder keeps working and
+  // the encoder/muxer can finish writing the remaining frames.
+  WaitForVideoDone(5);
+
+  // Now it is safe to switch back to image mode.
   g_object_set(gst_.camerabin, "mode", 1, NULL);
+  std::cout << "Video recording stopped, file: " << video_file_path_
+            << std::endl;
 
-  // The bus sync handler should have already fired "video-done" and
-  // consumed on_video_done_. If it hasn't (some pipelines may not
-  // emit the message), invoke the callback directly.
-  if (on_video_done_) {
-    on_video_done_(video_file_path_);
-    on_video_done_ = nullptr;
+  // Deliver the result to the caller.
+  if (on_video_done) {
+    on_video_done(video_file_path_);
   }
 }
 
@@ -164,11 +225,19 @@ bool GstCamera::PauseVideoRecording() {
     return true;
   }
 
-  auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PAUSED);
-  if (result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Failed to pause video recording" << std::endl;
-    return false;
+  // Reset done-flag so we can wait for the segment to finish.
+  {
+    std::lock_guard<std::mutex> lock(video_done_mutex_);
+    video_done_received_ = false;
   }
+
+  // Stop the current capture segment.  The pipeline stays PLAYING so the
+  // viewfinder (preview) keeps running — only the recording path stops.
+  g_signal_emit_by_name(gst_.camerabin, "stop-capture", NULL);
+
+  // Wait briefly for the segment to be flushed.
+  WaitForVideoDone(3);
+
   is_recording_paused_ = true;
   std::cout << "Video recording paused" << std::endl;
   return true;
@@ -184,14 +253,35 @@ bool GstCamera::ResumeVideoRecording() {
     return true;
   }
 
-  auto result = gst_element_set_state(gst_.pipeline, GST_STATE_PLAYING);
-  if (result == GST_STATE_CHANGE_FAILURE) {
-    std::cerr << "Failed to resume video recording" << std::endl;
-    return false;
+  // Start a new capture segment with the same file path.
+  // Note: camerabin will overwrite the previous file.  For true
+  // multi-segment recording, each segment would need a unique path
+  // and post-processing concatenation.
+  g_object_set(gst_.camerabin, "location", video_file_path_.c_str(), NULL);
+
+  // Reset done-flag for the new segment.
+  {
+    std::lock_guard<std::mutex> lock(video_done_mutex_);
+    video_done_received_ = false;
   }
+
+  g_signal_emit_by_name(gst_.camerabin, "start-capture", NULL);
+
   is_recording_paused_ = false;
   std::cout << "Video recording resumed" << std::endl;
   return true;
+}
+
+bool GstCamera::WaitForVideoDone(int timeout_seconds) {
+  std::unique_lock<std::mutex> lock(video_done_mutex_);
+  bool done = video_done_cv_.wait_for(
+      lock, std::chrono::seconds(timeout_seconds),
+      [this] { return video_done_received_; });
+  if (!done) {
+    std::cerr << "Timed out waiting for video-done after "
+              << timeout_seconds << "s" << std::endl;
+  }
+  return done;
 }
 
 bool GstCamera::SetZoomLevel(float zoom) {
@@ -225,7 +315,7 @@ const uint8_t* GstCamera::GetPreviewFrameBuffer() {
   return reinterpret_cast<const uint8_t*>(pixels_.get());
 }
 
-// Creats a camra pipeline using camerabin.
+// Creates a camera pipeline using camerabin.
 // $ gst-launch-1.0 camerabin viewfinder-sink="videoconvert !
 // video/x-raw,format=RGBA ! fakesink"
 bool GstCamera::CreatePipeline() {
@@ -259,8 +349,7 @@ bool GstCamera::CreatePipeline() {
     std::cerr << "Failed to create a bus" << std::endl;
     return false;
   }
-  gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this,
-                           NULL);
+  gst_bus_set_sync_handler(gst_.bus, HandleGstMessage, this, NULL);
 
   // Sets properties to fakesink to get the callback of a decoded frame.
   g_object_set(G_OBJECT(gst_.video_sink), "sync", TRUE, "qos", FALSE, NULL);
@@ -357,7 +446,7 @@ void GstCamera::DestroyPipeline() {
 
 void GstCamera::GetZoomMaxMinSize(float& max, float& min) {
   if (!gst_.pipeline || !gst_.camerabin) {
-    std::cerr << "The pileline hasn't initialized yet.";
+    std::cerr << "The pipeline hasn't initialized yet.";
     return;
   }
 
@@ -367,7 +456,7 @@ void GstCamera::GetZoomMaxMinSize(float& max, float& min) {
 
 // static
 void GstCamera::HandoffHandler(GstElement* fakesink, GstBuffer* buf,
-                               GstPad* new_pad, gpointer user_data) {
+                                GstPad* new_pad, gpointer user_data) {
   auto* self = reinterpret_cast<GstCamera*>(user_data);
   auto* caps = gst_pad_get_current_caps(new_pad);
   auto* structure = gst_caps_get_structure(caps, 0);
@@ -407,12 +496,14 @@ GstBusSyncReply GstCamera::HandleGstMessage(GstBus* bus,
             self->on_notify_captured_) {
           auto const* filename = gst_structure_get_string(st, "filename");
           self->on_notify_captured_(filename);
-        } else if (gst_structure_has_name(st, "video-done") &&
-                   self->on_video_done_) {
-          auto const* filename = gst_structure_get_string(st, "filename");
-          std::string path = filename ? filename : self->video_file_path_;
-          self->on_video_done_(path);
-          self->on_video_done_ = nullptr;
+        } else if (gst_structure_has_name(st, "video-done")) {
+          // Signal the condvar so StopVideoRecording / PauseVideoRecording
+          // can proceed.  The actual result callback is invoked by the
+          // caller after it has finished switching mode — not here — so
+          // we don't block the streaming thread.
+          std::lock_guard<std::mutex> lock(self->video_done_mutex_);
+          self->video_done_received_ = true;
+          self->video_done_cv_.notify_one();
         }
       }
       break;
@@ -421,8 +512,8 @@ GstBusSyncReply GstCamera::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_warning(message, &error, &debug);
-      g_printerr("WARNING from element %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
+      g_printerr("WARNING from element %s: %s\n",
+                 GST_OBJECT_NAME(message->src), error->message);
       g_printerr("Warning details: %s\n", debug);
       g_free(debug);
       g_error_free(error);
@@ -432,8 +523,8 @@ GstBusSyncReply GstCamera::HandleGstMessage(GstBus* bus,
       gchar* debug;
       GError* error;
       gst_message_parse_error(message, &error, &debug);
-      g_printerr("ERROR from element %s: %s\n", GST_OBJECT_NAME(message->src),
-                 error->message);
+      g_printerr("ERROR from element %s: %s\n",
+                 GST_OBJECT_NAME(message->src), error->message);
       g_printerr("Error details: %s\n", debug);
       g_free(debug);
       g_error_free(error);

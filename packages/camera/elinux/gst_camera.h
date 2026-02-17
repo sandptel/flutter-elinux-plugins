@@ -7,8 +7,10 @@
 
 #include <gst/gst.h>
 
+#include <condition_variable>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 
@@ -36,6 +38,9 @@ class GstCamera {
   bool PauseVideoRecording();
   bool ResumeVideoRecording();
 
+  bool IsRecording() const { return is_recording_; }
+  bool IsRecordingPaused() const { return is_recording_paused_; }
+
   bool SetZoomLevel(float zoom);
   float GetMaxZoomLevel() const { return max_zoom_level_; };
   float GetMinZoomLevel() const { return min_zoom_level_; };
@@ -56,14 +61,18 @@ class GstCamera {
   };
 
   static void HandoffHandler(GstElement* fakesink, GstBuffer* buf,
-                             GstPad* new_pad, gpointer user_data);
+                              GstPad* new_pad, gpointer user_data);
   static GstBusSyncReply HandleGstMessage(GstBus* bus, GstMessage* message,
-                                   gpointer user_data);
+                                          gpointer user_data);
 
   bool CreatePipeline();
   void DestroyPipeline();
   void Preroll();
   void GetZoomMaxMinSize(float& max, float& min);
+
+  // Waits for the "video-done" bus message up to |timeout_seconds|.
+  // Returns true if the message was received, false on timeout.
+  bool WaitForVideoDone(int timeout_seconds);
 
   GstCameraElements gst_;
   std::unique_ptr<uint32_t> pixels_;
@@ -71,16 +80,25 @@ class GstCamera {
   int32_t height_ = -1;
   std::shared_mutex mutex_buffer_;
   std::unique_ptr<CameraStreamHandler> stream_handler_ = nullptr;
-  float max_zoom_level_;
-  float min_zoom_level_;
+  float max_zoom_level_ = 1.0f;
+  float min_zoom_level_ = 1.0f;
   float zoom_level_ = 1.0f;
   int captured_count_ = 0;
+
+  // Video recording state.
   bool is_recording_ = false;
   bool is_recording_paused_ = false;
-
-  OnNotifyCaptured on_notify_captured_ = nullptr;
-  OnNotifyCaptured on_video_done_ = nullptr;
   std::string video_file_path_;
+
+  // Callback for image capture completion.
+  OnNotifyCaptured on_notify_captured_ = nullptr;
+
+  // Synchronisation: StopVideoRecording waits for the "video-done" bus
+  // message so the muxer can flush all remaining frames before we switch
+  // mode back and deliver the result.
+  std::mutex video_done_mutex_;
+  std::condition_variable video_done_cv_;
+  bool video_done_received_ = false;
 };
 
 #endif  // PACKAGES_CAMERA_CAMERA_ELINUX_GST_CAMERA_H_
